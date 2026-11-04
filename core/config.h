@@ -199,7 +199,7 @@
 #define CONFIG_CONTACT_EDIT		(CONFIG_CHANNEL_EDIT && CONFIG_DMR)
 #endif
 #ifndef CONFIG_CONTACT_MENU_DEFAULT
-#define CONFIG_CONTACT_MENU_DEFAULT	1
+#define CONFIG_CONTACT_MENU_DEFAULT	0
 #endif
 // Zone writes that move zone indexes (core/codeplug/zone_edit.h): the zone editor's, and zone sharing's import of a
 // new zone. Whoever keeps a zone index (the radio core, dual watch, the open zone screens) follows them

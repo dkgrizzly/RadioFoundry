@@ -24,6 +24,9 @@
 #if CONFIG_SFR
 #include "dmr/sfr.h"
 #endif
+#if CONFIG_DMR_SMS
+#include "dmr/dmrData.h"
+#endif
 
 #ifndef RFOUNDRY_GIT
 #define RFOUNDRY_GIT "host"
@@ -331,6 +334,193 @@ static const ui_scr_def_t actions_screen = {
 	.count = act_count, .item = act_item, .select = act_select, .target = act_target, .title = act_title,
 };
 
+// ======================= Text entry: keypad letters (ui.md 2.1) =======================
+// Phone keypad: in ABC / abc, 2-9 cycle their letters, the digit, then the letters in the other case (ABC: A B C 2 a b
+// c); 1 cycles punctuation and 0 a space, 0 and a few signs. The same key within 1 s takes the next one, another key
+// or the pause moves on. In 123 a digit types itself, as a held digit does
+// in any mode. # cycles ABC -> 123 -> abc. BACK deletes the last character and leaves once the field is empty, without
+// a change (the phone convention; the one exception to P4, principles 4); * or Left delete too. OK keeps. Without a
+// keypad Up / Down step the last character (down past the space deletes it), OK adds one and long OK keeps
+
+#define TEXT_MULTI_MS	1000u
+#if CONFIG_DMR_SMS
+#define TEXT_EDIT_MAX_LEN DMR_ETSI_TEXT_MAX
+#else
+#define TEXT_EDIT_MAX_LEN CODEPLUG_NAME_LEN
+#endif
+static char *text_target;
+static void (*text_done)(void);		// called once the text is kept (NULL: none)
+static uint8_t text_max;
+static char text_buf[TEXT_EDIT_MAX_LEN + 1];
+static uint8_t text_len;
+static int8_t text_key = -1;		// the key that typed the last character, -1 = none to cycle
+static uint8_t text_idx;
+static uint32_t text_ms;
+enum { TEXT_UPPER, TEXT_DIGITS, TEXT_LOWER, TEXT_MODES };	// the order # cycles through
+static uint8_t text_mode;
+
+static void ui_text_open(char *target, uint8_t max)
+{
+	text_target = target;
+	text_done = NULL;
+	text_max = max < TEXT_EDIT_MAX_LEN ? max : TEXT_EDIT_MAX_LEN;
+	ui_push(SCR_TEXT, 0);
+}
+
+static void ui_custommsg_open(char *target, uint8_t max)
+{
+	text_target = target;
+	text_done = NULL;
+	text_max = max < TEXT_EDIT_MAX_LEN ? max : TEXT_EDIT_MAX_LEN;
+	ui_push(SCR_CUSTOM_MSG, 0);
+}
+
+static void text_enter(void)
+{
+	strncpy(text_buf, text_target, text_max);
+	text_buf[text_max] = 0;
+	text_len = (uint8_t)strlen(text_buf);
+	text_key = -1;
+	text_mode = TEXT_UPPER;
+}
+
+static uint16_t text_count(void) { return 1; }
+
+static void text_item(uint16_t i, ui_item_t *it)
+{
+	(void)i;
+	sbuf_t b;
+	sb_init(&b, it->label, sizeof it->label);
+	sb_str(&b, text_buf);
+	sb_chr(&b, '_');	// the cursor; the mode is in the title
+}
+
+static char text_case(char c)
+{
+	return text_mode == TEXT_LOWER && c >= 'A' && c <= 'Z' ? (char)(c - 'A' + 'a') : c;
+}
+
+// The keys with letters cycle letters, digit, then the letters again in the other case; the others their set as is
+static uint8_t text_cycle_len(const char *set)
+{
+	uint8_t n = (uint8_t)strlen(set);
+	return set[0] >= 'A' && set[0] <= 'Z' ? (uint8_t)(2u * n - 1u) : n;
+}
+
+static char text_char(const char *set, uint8_t idx)
+{
+	uint8_t n = (uint8_t)strlen(set);
+	if (!(set[0] >= 'A' && set[0] <= 'Z'))
+		return set[idx];
+	if (idx < n)
+		return idx == n - 1u ? set[idx] : text_case(set[idx]);	// the letters in the mode's case, then the digit
+	char c = set[idx - n];
+	return text_mode == TEXT_LOWER ? c : (char)(c - 'A' + 'a');	// then the other case
+}
+
+static void text_append(char c)
+{
+	if (text_len >= text_max) {
+		ui_toast(TR("That's the most it can hold"));
+		return;
+	}
+	text_buf[text_len++] = c;
+	text_buf[text_len] = 0;
+}
+
+static bool text_key_fn(const input_event_t *ev)
+{
+	// A key's characters within the timing window: its letters, its digit, its letters in the other case (text_char)
+	static const char *const keys[10] = { " 0+#*", ".-/,'&()@_!?1", "ABC2", "DEF3", "GHI4", "JKL5", "MNO6", "PQRS7",
+		"TUV8", "WXYZ9" };
+	bool press = ev->gesture == GESTURE_PRESS || ev->gesture == GESTURE_LONG;
+	uint32_t now = hal_millis();
+	if (ev->action >= ACT_DIGIT_0 && ev->action <= ACT_DIGIT_9 && press) {
+		int8_t k = (int8_t)(ev->action - ACT_DIGIT_0);
+		const char *set = keys[k];
+		if (text_mode == TEXT_DIGITS || ev->gesture == GESTURE_LONG) {
+			text_append((char)('0' + k));	// 123, or a held digit: the digit itself
+			text_key = -1;
+		} else if (k == text_key && text_len > 0 && now - text_ms < TEXT_MULTI_MS) {
+			text_idx = (uint8_t)((text_idx + 1u) % text_cycle_len(set));
+			text_buf[text_len - 1] = text_char(set, text_idx);
+			text_key = k;
+		} else {
+			text_idx = 0;
+			text_append(text_char(set, 0));
+			text_key = k;
+		}
+		text_ms = now;
+		ui_dirty();
+		return true;
+	}
+	int dir = ev->action == ACT_NAV_UP ? 1 : ev->action == ACT_NAV_DOWN ? -1 :
+		ev->action == ACT_ENC_STEP ? (ev->value > 0 ? 1 : -1) : 0;
+	if (dir != 0 && ev->gesture != GESTURE_UP) {
+		// Step the last character through the printable ones (the way in without a keypad); down past the space
+		// deletes it
+		if (text_len == 0)
+			text_append('A');
+		else if (dir < 0 && text_buf[text_len - 1] == ' ')
+			text_buf[--text_len] = 0;
+		else
+			text_buf[text_len - 1] = (char)(' ' + (text_buf[text_len - 1] - ' ' + dir + 95) % 95);
+		text_key = -1;
+		ui_dirty();
+		return true;
+	}
+	if (ev->action == ACT_CONTEXT && ev->gesture == GESTURE_PRESS) {
+		text_mode = (uint8_t)((text_mode + 1u) % TEXT_MODES);
+		text_key = -1;	// the next key starts a new character
+		ui_dirty();
+		return true;
+	}
+	if (ev->action == ACT_BACK && ev->gesture == GESTURE_PRESS && text_len == 0) {
+		ui_pop();	// an empty field: BACK leaves, the name as it was
+		return true;
+	}
+	if (((ev->action == ACT_BACK || ev->action == ACT_NAV_LEFT) && ev->gesture == GESTURE_PRESS) ||
+			(ev->action == ACT_QUICK && press)) {	// a slow * deletes too (it doesn't lock here)
+		if (text_len > 0)
+			text_buf[--text_len] = 0;
+		text_key = -1;
+		ui_dirty();
+		return true;
+	}
+	if (ev->action == ACT_SELECT && press) {
+		if (!(board.caps & CAP_KEYPAD) && ev->gesture == GESTURE_PRESS) {
+			text_append(text_len > 0 ? text_buf[text_len - 1] : 'A');	// the next character, started as this one
+		} else {
+			strcpy(text_target, text_buf);
+			ui_pop();
+			if (text_done != NULL)
+				text_done();
+		}
+		ui_dirty();
+		return true;
+	}
+	return false;
+}
+
+// The title carries the mode, so it shows however long the name is: "Name · ABC"
+static const char *text_title(void)
+{
+	static const char *const modes[TEXT_MODES] = { "ABC", "123", "abc" };
+	return modes[text_mode];
+}
+
+static const ui_scr_def_t text_screen = {
+	.name = "text", .flags = SF_LIST, .prefix = TRN("Name"), .title = text_title,
+	.hint = TRN(TEXT_ALT_OPEN "Back delete  # ABC/123/abc  OK keep" TEXT_ALT_NEXT "Back del  # mode  OK" TEXT_ALT_CLOSE),
+	.count = text_count, .item = text_item, .key = text_key_fn, .enter = text_enter,
+};
+
+static const ui_scr_def_t custom_message_screen = {
+	.name = "text", .flags = SF_LIST, .prefix = TRN("Message"), .title = text_title,
+	.hint = TRN(TEXT_ALT_OPEN "Back delete  # ABC/123/abc  OK keep" TEXT_ALT_NEXT "Back del  # mode  OK" TEXT_ALT_CLOSE),
+	.count = text_count, .item = text_item, .key = text_key_fn, .enter = text_enter,
+};
+
 // ======================= Message composer (canned first) =======================
 
 // Sent in the language in use (the text goes out as UTF-16, Latin-1 included)
@@ -370,13 +560,34 @@ static void send_text(const char *text)
 	ui_toast(msg);
 }
 
+#if CONFIG_DMR_SMS
+static char compose_msg[DMR_ETSI_TEXT_MAX+1];
+
+static void compose_complete(void)
+{
+	if (compose_msg[0] == 0) {
+		ui_toast(TR("Not sending empty msg"));
+		return;
+	}
+	send_text(compose_msg);
+}
+#endif
+
 static void compose_select(uint16_t i, bool hold)
 {
 	(void)hold;
 	if (i < CANNED_N)
 		send_text(tr(canned[i]));
+#if CONFIG_DMR_SMS
+	else {
+		compose_msg[0] = 0;
+		ui_custommsg_open(compose_msg, DMR_ETSI_TEXT_MAX);
+		text_done = compose_complete;
+	}
+#else
 	else
 		ui_toast(TR("Typing: not in this build"));
+#endif
 }
 
 static const char *compose_title(void)
@@ -2130,7 +2341,6 @@ static void chinfo_item(uint16_t i, ui_item_t *it)
 }
 
 #if CONFIG_CHANNEL_EDIT
-static void ui_text_open(char *target, uint8_t max);
 static bool discard_contact;	// Unsaved Changes asks about the contact editor's new contact (else a channel)
 
 // The first problem that keeps the copy from being saved, as a toast; NULL when it can be saved
@@ -2531,174 +2741,6 @@ static const ui_scr_def_t discard_screen = {
 	.count = discard_count, .item = discard_item, .select = discard_select, .body = discard_body,
 };
 
-// ======================= Text entry: keypad letters (ui.md 2.1) =======================
-// Phone keypad: in ABC / abc, 2-9 cycle their letters, the digit, then the letters in the other case (ABC: A B C 2 a b
-// c); 1 cycles punctuation and 0 a space, 0 and a few signs. The same key within 1 s takes the next one, another key
-// or the pause moves on. In 123 a digit types itself, as a held digit does
-// in any mode. # cycles ABC -> 123 -> abc. BACK deletes the last character and leaves once the field is empty, without
-// a change (the phone convention; the one exception to P4, principles 4); * or Left delete too. OK keeps. Without a
-// keypad Up / Down step the last character (down past the space deletes it), OK adds one and long OK keeps
-
-#define TEXT_MULTI_MS	1000u
-
-static char *text_target;
-static void (*text_done)(void);		// called once the text is kept (NULL: none)
-static uint8_t text_max;
-static char text_buf[CODEPLUG_NAME_LEN + 1];
-static uint8_t text_len;
-static int8_t text_key = -1;		// the key that typed the last character, -1 = none to cycle
-static uint8_t text_idx;
-static uint32_t text_ms;
-enum { TEXT_UPPER, TEXT_DIGITS, TEXT_LOWER, TEXT_MODES };	// the order # cycles through
-static uint8_t text_mode;
-
-static void ui_text_open(char *target, uint8_t max)
-{
-	text_target = target;
-	text_done = NULL;
-	text_max = max < CODEPLUG_NAME_LEN ? max : CODEPLUG_NAME_LEN;
-	ui_push(SCR_TEXT, 0);
-}
-
-static void text_enter(void)
-{
-	strncpy(text_buf, text_target, text_max);
-	text_buf[text_max] = 0;
-	text_len = (uint8_t)strlen(text_buf);
-	text_key = -1;
-	text_mode = TEXT_UPPER;
-}
-
-static uint16_t text_count(void) { return 1; }
-
-static void text_item(uint16_t i, ui_item_t *it)
-{
-	(void)i;
-	sbuf_t b;
-	sb_init(&b, it->label, sizeof it->label);
-	sb_str(&b, text_buf);
-	sb_chr(&b, '_');	// the cursor; the mode is in the title
-}
-
-static char text_case(char c)
-{
-	return text_mode == TEXT_LOWER && c >= 'A' && c <= 'Z' ? (char)(c - 'A' + 'a') : c;
-}
-
-// The keys with letters cycle letters, digit, then the letters again in the other case; the others their set as is
-static uint8_t text_cycle_len(const char *set)
-{
-	uint8_t n = (uint8_t)strlen(set);
-	return set[0] >= 'A' && set[0] <= 'Z' ? (uint8_t)(2u * n - 1u) : n;
-}
-
-static char text_char(const char *set, uint8_t idx)
-{
-	uint8_t n = (uint8_t)strlen(set);
-	if (!(set[0] >= 'A' && set[0] <= 'Z'))
-		return set[idx];
-	if (idx < n)
-		return idx == n - 1u ? set[idx] : text_case(set[idx]);	// the letters in the mode's case, then the digit
-	char c = set[idx - n];
-	return text_mode == TEXT_LOWER ? c : (char)(c - 'A' + 'a');	// then the other case
-}
-
-static void text_append(char c)
-{
-	if (text_len >= text_max) {
-		ui_toast(TR("That's the most it can hold"));
-		return;
-	}
-	text_buf[text_len++] = c;
-	text_buf[text_len] = 0;
-}
-
-static bool text_key_fn(const input_event_t *ev)
-{
-	// A key's characters within the timing window: its letters, its digit, its letters in the other case (text_char)
-	static const char *const keys[10] = { " 0+#*", ".-/,'&()@_!?1", "ABC2", "DEF3", "GHI4", "JKL5", "MNO6", "PQRS7",
-		"TUV8", "WXYZ9" };
-	bool press = ev->gesture == GESTURE_PRESS || ev->gesture == GESTURE_LONG;
-	uint32_t now = hal_millis();
-	if (ev->action >= ACT_DIGIT_0 && ev->action <= ACT_DIGIT_9 && press) {
-		int8_t k = (int8_t)(ev->action - ACT_DIGIT_0);
-		const char *set = keys[k];
-		if (text_mode == TEXT_DIGITS || ev->gesture == GESTURE_LONG) {
-			text_append((char)('0' + k));	// 123, or a held digit: the digit itself
-			text_key = -1;
-		} else if (k == text_key && text_len > 0 && now - text_ms < TEXT_MULTI_MS) {
-			text_idx = (uint8_t)((text_idx + 1u) % text_cycle_len(set));
-			text_buf[text_len - 1] = text_char(set, text_idx);
-			text_key = k;
-		} else {
-			text_idx = 0;
-			text_append(text_char(set, 0));
-			text_key = k;
-		}
-		text_ms = now;
-		ui_dirty();
-		return true;
-	}
-	int dir = ev->action == ACT_NAV_UP ? 1 : ev->action == ACT_NAV_DOWN ? -1 :
-		ev->action == ACT_ENC_STEP ? (ev->value > 0 ? 1 : -1) : 0;
-	if (dir != 0 && ev->gesture != GESTURE_UP) {
-		// Step the last character through the printable ones (the way in without a keypad); down past the space
-		// deletes it
-		if (text_len == 0)
-			text_append('A');
-		else if (dir < 0 && text_buf[text_len - 1] == ' ')
-			text_buf[--text_len] = 0;
-		else
-			text_buf[text_len - 1] = (char)(' ' + (text_buf[text_len - 1] - ' ' + dir + 95) % 95);
-		text_key = -1;
-		ui_dirty();
-		return true;
-	}
-	if (ev->action == ACT_CONTEXT && ev->gesture == GESTURE_PRESS) {
-		text_mode = (uint8_t)((text_mode + 1u) % TEXT_MODES);
-		text_key = -1;	// the next key starts a new character
-		ui_dirty();
-		return true;
-	}
-	if (ev->action == ACT_BACK && ev->gesture == GESTURE_PRESS && text_len == 0) {
-		ui_pop();	// an empty field: BACK leaves, the name as it was
-		return true;
-	}
-	if (((ev->action == ACT_BACK || ev->action == ACT_NAV_LEFT) && ev->gesture == GESTURE_PRESS) ||
-			(ev->action == ACT_QUICK && press)) {	// a slow * deletes too (it doesn't lock here)
-		if (text_len > 0)
-			text_buf[--text_len] = 0;
-		text_key = -1;
-		ui_dirty();
-		return true;
-	}
-	if (ev->action == ACT_SELECT && press) {
-		if (!(board.caps & CAP_KEYPAD) && ev->gesture == GESTURE_PRESS) {
-			text_append(text_len > 0 ? text_buf[text_len - 1] : 'A');	// the next character, started as this one
-		} else {
-			strcpy(text_target, text_buf);
-			ui_pop();
-			if (text_done != NULL)
-				text_done();
-		}
-		ui_dirty();
-		return true;
-	}
-	return false;
-}
-
-// The title carries the mode, so it shows however long the name is: "Name · ABC"
-static const char *text_title(void)
-{
-	static const char *const modes[TEXT_MODES] = { "ABC", "123", "abc" };
-	return modes[text_mode];
-}
-
-static const ui_scr_def_t text_screen = {
-	.name = "text", .flags = SF_LIST, .prefix = TRN("Name"), .title = text_title,
-	.hint = TRN(TEXT_ALT_OPEN "Back delete  # ABC/123/abc  OK keep" TEXT_ALT_NEXT "Back del  # mode  OK" TEXT_ALT_CLOSE),
-	.count = text_count, .item = text_item, .key = text_key_fn, .enter = text_enter,
-};
 
 #if CONFIG_CONTACT_EDIT
 // ======================= The contact editor (ui.md 2.4) =======================
@@ -5763,14 +5805,16 @@ const ui_scr_def_t *const ui_scr[SCR_COUNT] = {
 	[SCR_VOLUME] = &volume_screen, [SCR_LANGUAGE] = &lang_screen,
 	[SCR_DMR_ID] = &dmr_id_screen,
 	[SCR_CP_FOREIGN] = &cpf_screen,
+	[SCR_TEXT] = &text_screen,
+	[SCR_CUSTOM_MSG] = &custom_message_screen,
 #if CONFIG_REF_TRIM
 	[SCR_REF_TRIM] = &trim_screen,
 #endif
 #if CONFIG_CHANNEL_LIST
 	[SCR_CHANNELS] = &chlist_screen, [SCR_CHANNEL] = &chinfo_screen,
 #if CONFIG_CHANNEL_EDIT
-	[SCR_TEXT] = &text_screen, [SCR_DISCARD] = &discard_screen,
-#if CONFIG_CONTACT_EDIT
+	[SCR_DISCARD] = &discard_screen,
+if CONFIG_CONTACT_EDIT
 	[SCR_CONTACT_EDIT] = &contact_edit_screen,
 #endif
 #if CONFIG_ZONE_EDIT

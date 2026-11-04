@@ -504,19 +504,31 @@ static void contacts_select(uint16_t i, bool hold)
 	}
 #endif
 	if (contacts_list_target(i, &t))
+#if CONFIG_CONTACT_MENU_DEFAULT
+		ui_open_actions(&t);
+#else
 		ui_talk(&t, hold);
+#endif
 }
 
 static void contacts_context(uint16_t i)
 {
 	ui_target_t t;
 	if (contacts_list_target(i, &t))
+#if CONFIG_CONTACT_MENU_DEFAULT
+		ui_talk(&t, false);
+#else
 		ui_open_actions(&t);
+#endif
 }
 
 static const ui_scr_def_t contacts_screen = {
 	.name = "contacts", .flags = SF_LIST | SF_FILTER | SF_FIELD, .prefix = TRN("Contacts"),
+#if CONFIG_CONTACT_MENU_DEFAULT
+	.hint = TRN(TEXT_ALT_OPEN "0-9 find  OK more  # talk" TEXT_ALT_NEXT "0-9  OK more  # talk" TEXT_ALT_CLOSE),
+#else
 	.hint = TRN(TEXT_ALT_OPEN "0-9 find  OK talk  # more" TEXT_ALT_NEXT "0-9  OK talk  # more" TEXT_ALT_CLOSE),
+#endif
 	.empty = CONFIG_CONTACT_EDIT ? TRN("No contact matches") : TRN("No contacts: add them in qdmr"),
 	.count = ui_filter_count, .item = contacts_list_item, .select = contacts_select, .context = contacts_context,
 	.target = contacts_list_target, .raw_count = contacts_list_raw_count, .raw_label = contacts_list_raw_label,

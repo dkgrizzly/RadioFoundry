@@ -19,6 +19,7 @@ void sb_init(sbuf_t *b, char *buf, size_t len);
 // (i18n.h), whose length isn't known when the code is written
 void str_copy(char *dst, size_t cap, const char *src);
 void sb_str(sbuf_t *b, const char *s);
+void sb_substr(sbuf_t *b, const char *s, size_t offset, size_t len);
 void sb_chr(sbuf_t *b, char c);
 // Unsigned decimal with at least min_digits digits (zero padded)
 void sb_u32(sbuf_t *b, uint32_t v, int min_digits);

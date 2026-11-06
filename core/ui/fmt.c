@@ -34,6 +34,20 @@ void sb_str(sbuf_t *b, const char *s)
 		sb_chr(b, *s++);
 }
 
+void sb_substr(sbuf_t *b, const char *s, size_t offset, size_t len)
+{
+	while (*s && len) {
+		if(offset) {
+			offset--; s++;
+    } else {
+			if(len) {
+				len--;
+				sb_chr(b, *s++);
+			}
+		}
+	}
+}
+
 void sb_u32(sbuf_t *b, uint32_t v, int min_digits)
 {
 	char tmp[10];

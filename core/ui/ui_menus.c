@@ -358,20 +358,31 @@ static uint8_t text_idx;
 static uint32_t text_ms;
 enum { TEXT_UPPER, TEXT_DIGITS, TEXT_LOWER, TEXT_MODES };	// the order # cycles through
 static uint8_t text_mode;
+enum { TEXT_NAME, TEXT_MESSAGE, TEXT_PREFIXES };
+static uint8_t text_prefix;
+static uint8_t text_linewidth;
 
 static void ui_text_open(char *target, uint8_t max)
 {
+	const ui_layout_t *L = &ui_layout;
+
 	text_target = target;
 	text_done = NULL;
 	text_max = max < TEXT_EDIT_MAX_LEN ? max : TEXT_EDIT_MAX_LEN;
+	text_linewidth = gfx_width() / L->small->w;
+	text_prefix = TEXT_NAME;
 	ui_push(SCR_TEXT, 0);
 }
 
 static void ui_custommsg_open(char *target, uint8_t max)
 {
+	const ui_layout_t *L = &ui_layout;
+
 	text_target = target;
 	text_done = NULL;
 	text_max = max < TEXT_EDIT_MAX_LEN ? max : TEXT_EDIT_MAX_LEN;
+	text_linewidth = gfx_width() / L->small->w;
+	text_prefix = TEXT_MESSAGE;
 	ui_push(SCR_CUSTOM_MSG, 0);
 }
 
@@ -384,15 +395,52 @@ static void text_enter(void)
 	text_mode = TEXT_UPPER;
 }
 
-static uint16_t text_count(void) { return 1; }
-
-static void text_item(uint16_t i, ui_item_t *it)
+static void text_draw(void)
 {
-	(void)i;
+	static const char *const prefixes[TEXT_PREFIXES] = { "Name", "Message" };
+	static const char *const modes[TEXT_MODES] = { "ABC", "123", "abc" };
+	const ui_layout_t *L = &ui_layout;
+	char linebuf[32];
 	sbuf_t b;
-	sb_init(&b, it->label, sizeof it->label);
-	sb_str(&b, text_buf);
-	sb_chr(&b, '_');	// the cursor; the mode is in the title
+	gfx_clear(ui_col.bg);
+	text_len = (uint8_t)strlen(text_buf);
+
+	sb_init(&b, linebuf, sizeof linebuf);
+	sb_str(&b, prefixes[text_prefix]);
+	sb_chr(&b, ' ');
+	sb_chr(&b, ' ');
+	sb_u32(&b, text_len, 3);
+	sb_chr(&b, '/');
+	sb_u32(&b, text_max, 3);
+	sb_chr(&b, ' ');
+	
+	int y = ui_draw_top(ui_view(), &ui_st, linebuf, modes[text_mode]) + 2;
+	uint8_t roomy = (L->hint_y - y) / L->small->h;	// number of lines of text we can show
+	uint16_t max_chars = roomy * text_linewidth;
+	uint16_t start_char;
+	if(max_chars >= text_len) {
+		start_char = 0;
+	} else {
+		// Ensure there is room for the "_" at the end of the message being entered
+		start_char = 1+text_len-max_chars;
+	}
+
+	const font_t *small = L->small;
+	do {
+		sb_init(&b, linebuf, sizeof linebuf);
+		if((text_len-start_char) > 0) {
+			sb_substr(&b, text_buf, start_char, text_linewidth);
+			start_char+=text_linewidth;
+		}
+		if((strlen(linebuf) < text_linewidth) && (start_char >= text_len)) {
+			sb_chr(&b, '_');	// the cursor; the mode is in the title
+			start_char++;
+		}
+		gfx_text(small, 0, y, linebuf, ui_col.fg);
+		y += L->small->h;
+	} while(start_char < (text_len+1));
+
+	ui_draw_hint(TRN(TEXT_ALT_OPEN "Back delete  # ABC/123/abc  OK keep" TEXT_ALT_NEXT "Back del  # mode  OK" TEXT_ALT_CLOSE), false);
 }
 
 static char text_case(char c)
@@ -502,23 +550,12 @@ static bool text_key_fn(const input_event_t *ev)
 	return false;
 }
 
-// The title carries the mode, so it shows however long the name is: "Name · ABC"
-static const char *text_title(void)
-{
-	static const char *const modes[TEXT_MODES] = { "ABC", "123", "abc" };
-	return modes[text_mode];
-}
-
 static const ui_scr_def_t text_screen = {
-	.name = "text", .flags = SF_LIST, .prefix = TRN("Name"), .title = text_title,
-	.hint = TRN(TEXT_ALT_OPEN "Back delete  # ABC/123/abc  OK keep" TEXT_ALT_NEXT "Back del  # mode  OK" TEXT_ALT_CLOSE),
-	.count = text_count, .item = text_item, .key = text_key_fn, .enter = text_enter,
+	.name = "text", .flags = SF_FIELD, .key = text_key_fn, .enter = text_enter, .draw = text_draw,
 };
 
 static const ui_scr_def_t custom_message_screen = {
-	.name = "text", .flags = SF_LIST, .prefix = TRN("Message"), .title = text_title,
-	.hint = TRN(TEXT_ALT_OPEN "Back delete  # ABC/123/abc  OK keep" TEXT_ALT_NEXT "Back del  # mode  OK" TEXT_ALT_CLOSE),
-	.count = text_count, .item = text_item, .key = text_key_fn, .enter = text_enter,
+	.name = "text", .flags = SF_FIELD, .key = text_key_fn, .enter = text_enter, .draw = text_draw,
 };
 
 // ======================= Message composer (canned first) =======================
@@ -539,7 +576,6 @@ static void compose_item(uint16_t i, ui_item_t *it)
 		sb_chr(&b, '"');
 	} else {
 		str_copy(it->label, sizeof it->label, TR("Write..."));
-		it->flags |= UI_ITEM_DIM;
 	}
 }
 
@@ -5814,7 +5850,7 @@ const ui_scr_def_t *const ui_scr[SCR_COUNT] = {
 	[SCR_CHANNELS] = &chlist_screen, [SCR_CHANNEL] = &chinfo_screen,
 #if CONFIG_CHANNEL_EDIT
 	[SCR_DISCARD] = &discard_screen,
-if CONFIG_CONTACT_EDIT
+#if CONFIG_CONTACT_EDIT
 	[SCR_CONTACT_EDIT] = &contact_edit_screen,
 #endif
 #if CONFIG_ZONE_EDIT
